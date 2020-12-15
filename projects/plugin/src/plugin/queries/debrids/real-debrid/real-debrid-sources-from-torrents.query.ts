@@ -2,7 +2,7 @@ import { Observable, of } from 'rxjs';
 import { RealDebridTorrentsInstantAvailabilityForm } from '../../../services/real-debrid/forms/torrents/real-debrid-torrents-instant-availability.form';
 import { catchError, finalize, map, switchMap } from 'rxjs/operators';
 import { SourceQuery } from '../../../entities/source-query';
-import { getHashFromUrl, getSupportedMedia, isEpisodeCodeMatchesFileName } from '../../../services/tools';
+import { getHashFromUrl, isEpisodeCodeMatchesFileName, isVideoFile } from '../../../services/tools';
 import { RealDebridApiService } from '../../../services/real-debrid/services/real-debrid-api.service';
 import { TorrentSource } from '../../../entities/torrent-source';
 import { StreamLinkSource } from '../../../entities/stream-link-source';
@@ -36,17 +36,21 @@ export class RealDebridSourcesFromTorrentsQuery {
     return Math.round(res * 100) / 100 + ' ' + unit;
   }
 
+  private static setHash(torrent: TorrentSource) {
+    let hash = torrent.hash;
+
+    if (!hash) {
+      hash = getHashFromUrl(torrent.url);
+    }
+    if (hash && !torrent.hash) {
+      torrent.hash = hash;
+    }
+  }
+
   private static getAllHash(torrents: TorrentSource[]) {
     const allHashes = [];
     torrents.forEach((torrent) => {
-      let hash = torrent.hash;
-
-      if (!hash) {
-        hash = getHashFromUrl(torrent.url);
-      }
-      if (hash && !torrent.hash) {
-        torrent.hash = hash;
-      }
+      this.setHash(torrent);
 
       if (torrent.hash && !allHashes.includes(torrent.hash)) {
         allHashes.push(torrent.hash);
@@ -66,6 +70,8 @@ export class RealDebridSourcesFromTorrentsQuery {
     return RealDebridTorrentsInstantAvailabilityForm.submit(allHashes).pipe(
       map((realDebridTorrentsInstantAvailabilityDto) => {
         torrents.forEach((torrent) => {
+          this.setHash(torrent);
+
           if (!torrent.hash) {
             return;
           }
@@ -76,6 +82,7 @@ export class RealDebridSourcesFromTorrentsQuery {
 
           // Take the group with the most video files
           let groupIndex = sourceQuery.query ? null : 0;
+          let matchFiles = new Map<string, number>();
 
           if (sourceQuery.episode) {
             const groupWithFile = [];
@@ -86,11 +93,12 @@ export class RealDebridSourcesFromTorrentsQuery {
               sourceQuery.category === 'anime' ? sourceQuery.episode.absoluteNumber.toString() : sourceQuery.episode.episodeCode;
 
             let episodeFound = false;
+
             data.rd.forEach((rd, index) => {
               Object.keys(rd).forEach((key) => {
                 const file = rd[key];
 
-                if (!firstVideoFileIndex && file.filename.match(/.mkv|.mp4/)) {
+                if (!firstVideoFileIndex && isVideoFile(file.filename)) {
                   firstVideoFileIndex = index;
                 }
 
@@ -101,9 +109,10 @@ export class RealDebridSourcesFromTorrentsQuery {
                   match = isEpisodeCodeMatchesFileName(episodeCode, file.filename);
                 }
 
-                if (file.filename.match(/.mkv|.mp4/) && match) {
+                if (isVideoFile(file.filename) && match && !groupWithFile.includes(index)) {
                   groupWithFile.push(index);
                   episodeFound = true;
+                  matchFiles.set(file.filename, index);
                 }
               });
             });
@@ -149,7 +158,45 @@ export class RealDebridSourcesFromTorrentsQuery {
               RealDebridGetCachedUrlQuery.getData(torrent.url, fileIds)
                 .pipe(finalize(() => loader.dismiss()))
                 .subscribe(
-                  (links) => {
+                  async (links) => {
+                    if (matchFiles.size > 1) {
+                      const buttons = [];
+                      matchFiles.forEach((index, filename) => {
+                        buttons.push({
+                          text: filename,
+                          handler: () => {
+                            const newLinks = [];
+                            links.forEach((link) => {
+                              if (link.filename === filename) {
+                                newLinks.push(link);
+                              }
+                            });
+
+                            observer.next(newLinks);
+                            observer.complete();
+                          }
+                        });
+                      });
+
+                      buttons.push({
+                        text: 'Cancel',
+                        icon: 'close',
+                        role: 'cancel',
+                        handler: () => {
+                          console.log('Cancel clicked');
+                        }
+                      });
+
+                      const action = new ActionSheetController();
+                      const a = await action.create({
+                        header: 'Select a file',
+                        buttons
+                      });
+                      a.present();
+
+                      return;
+                    }
+
                     observer.next(links);
                     observer.complete();
                   },
@@ -161,10 +208,12 @@ export class RealDebridSourcesFromTorrentsQuery {
             }
 
             const buttons = [];
+
             data.rd.forEach((rd, index) => {
               Object.keys(rd).forEach((key) => {
                 const file = rd[key];
-                if (!file.filename || file.filename.match(/.mkv|.mp4/) === null) {
+
+                if (!file.filename || !isVideoFile(file.filename)) {
                   return;
                 }
 
@@ -176,7 +225,6 @@ export class RealDebridSourcesFromTorrentsQuery {
                     let loader2;
                     loader
                       .create({
-                        message: 'Please wait...',
                         spinner: 'crescent',
                         backdropDismiss: true
                       })
@@ -209,16 +257,14 @@ export class RealDebridSourcesFromTorrentsQuery {
               });
             });
 
-            if (buttons.length > 5) {
-              buttons.push({
-                text: 'Cancel',
-                icon: 'close',
-                role: 'cancel',
-                handler: () => {
-                  console.log('Cancel clicked');
-                }
-              });
-            }
+            buttons.push({
+              text: 'Cancel',
+              icon: 'close',
+              role: 'cancel',
+              handler: () => {
+                console.log('Cancel clicked');
+              }
+            });
 
             const action = new ActionSheetController();
             action
@@ -237,9 +283,8 @@ export class RealDebridSourcesFromTorrentsQuery {
                 const link = links.slice(0).pop();
 
                 const ext = '.' + link.filename.split('.').pop().toLowerCase();
-                const commonVideoExtensions = getSupportedMedia('video').split('|');
 
-                if (!commonVideoExtensions.includes(ext) || ext === '.rar') {
+                if (!isVideoFile(link.filename) || ext === '.rar') {
                   // try to get all files
                   return RealDebridGetCachedUrlQuery.getData(torrent.url, []);
                 }

@@ -8,6 +8,9 @@ import { RealDebridTorrentsInfoForm } from '../../../services/real-debrid/forms/
 import { RealDebridUnrestrictLinkForm } from '../../../services/real-debrid/forms/unrestrict/real-debrid-unrestrict-link.form';
 import { RealDebridTorrentsAddMagnetDto } from '../../../services/real-debrid/dtos/torrents/real-debrid-torrents-add-magnet.dto';
 import { HeliosCacheService } from '../../../services/provider-cache.service';
+import { isVideoFile } from '../../../services/tools';
+
+export const RD_ERR_CODE_NOT_FULLY_CACHED = 100;
 
 export class RealDebridGetCachedUrlQuery {
   static getData(url: string, fileIds: string[]): Observable<RealDebridUnrestrictLinkDto[]> {
@@ -42,10 +45,40 @@ export class RealDebridGetCachedUrlQuery {
                       )
                     );
                   });
-                  return forkJoin(obs).pipe(mapTo(links));
+                  return forkJoin(obs).pipe(
+                    switchMap(() => {
+                      const videoLinks = [];
+                      const otherLinks = [];
+
+                      links.forEach((link) => {
+                        const ext = '.' + link.filename.split('.').pop().toLowerCase();
+
+                        if (!isVideoFile(link.filename) || ext === '.rar') {
+                          otherLinks.push(link);
+                        } else {
+                          videoLinks.push(link);
+                        }
+                      });
+
+                      if (videoLinks.length === 0 && otherLinks.length > 0 && fileId !== 'all') {
+                        return this.getData(url, []);
+                      }
+
+                      if (videoLinks.length === 0 && otherLinks.length > 0) {
+                        videoLinks.push(...otherLinks);
+                      }
+                      return of(videoLinks);
+                    })
+                  );
                 }
 
-                return throwError('No links found');
+                if (fileId !== 'all') {
+                  return this.getData(url, []);
+                }
+                return throwError({
+                  code: RD_ERR_CODE_NOT_FULLY_CACHED,
+                  message: 'Real Debrid: No links found. It seems the source is not fully cached, try to add the torrent manually'
+                });
               })
             );
           }),
@@ -54,9 +87,22 @@ export class RealDebridGetCachedUrlQuery {
               RealDebridTorrentsDeleteForm.submit(torrentInfo.id).subscribe();
             }
           }),
-          switchMap((links: RealDebridUnrestrictLinkDto[]) => {
-            if (!links) {
-              return throwError('No links found');
+          switchMap((allLinks: RealDebridUnrestrictLinkDto[]) => {
+            const links: RealDebridUnrestrictLinkDto[] = [];
+
+            if (allLinks) {
+              allLinks.forEach((link) => {
+                if (link.mimeType.match('video') !== null || link.mimeType === 'application/x-rar-compressed') {
+                  links.push(link);
+                }
+              });
+            }
+
+            if (links.length === 0) {
+              return throwError({
+                code: RD_ERR_CODE_NOT_FULLY_CACHED,
+                message: 'Real Debrid: No links found. It seems the source is not fully cached, try to add the torrent manually'
+              });
             }
             return from(HeliosCacheService.set(cacheKey, links, '15min')).pipe(mapTo(links));
           })
